@@ -764,7 +764,7 @@ fetch('dashboard_data.json').then(r=>r.json()).then(data=>{
 
 
 
-def main() -> None:
+def run_scrape() -> None:
     try:
         html_text = fetch_page()
     except Exception as e:
