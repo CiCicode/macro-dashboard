@@ -1,26 +1,170 @@
 from __future__ import annotations
 
+import csv
 import html
 import io
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
-import cloudscraper
-import pandas as pd
+import requests
+from curl_cffi import requests as cffi_requests
 
 URL = "https://www.macromicro.me/macro/us"
-OUT_DIR = Path(__file__).parent
-CSV_PATH = OUT_DIR / "top_charts.csv"
-DASHBOARD_DATA_PATH = OUT_DIR / "dashboard_data.json"
-SERIES_JSON_PATH = OUT_DIR / "series_last_rows.json"
-SCRAPER = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "desktop": True}
-)
+DEFAULT_OUT_DIR = Path(__file__).parent
+
+import random
+
+PROXY = (os.environ.get("SCRAPER_PROXY") or "").strip()
+# Comma-separated proxy URLs OR an http(s) URL returning a newline-separated list.
+PROXY_LIST_SRC = (os.environ.get("SCRAPER_PROXY_LIST") or "").strip()
+
+_PROXY_LIST_CACHE: list[str] | None = None
+_WORKING_PROXY: str | None = None
+
+_DEFAULT_PROXY_LIST_URLS = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+]
+
+_GOOGLEBOT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+_IMPERSONATIONS = ["chrome120", "chrome110", "safari17_0"]
+
+
+def _is_blocked(text: str) -> bool:
+    return len(text) < 5000 or "Just a moment" in text
+
+
+def _load_proxy_pool() -> list[str]:
+    """Return a list of proxy URLs (no protocol = assume http://)."""
+    global _PROXY_LIST_CACHE
+    if _PROXY_LIST_CACHE is not None:
+        return _PROXY_LIST_CACHE
+
+    raw_lines: list[str] = []
+
+    sources: list[str] = []
+    if PROXY_LIST_SRC:
+        if PROXY_LIST_SRC.startswith("http"):
+            sources.append(PROXY_LIST_SRC)
+        else:
+            raw_lines.extend(PROXY_LIST_SRC.split(","))
+    else:
+        sources.extend(_DEFAULT_PROXY_LIST_URLS)
+
+    for src in sources:
+        try:
+            r = requests.get(src, timeout=15)
+            if r.status_code == 200:
+                raw_lines.extend(r.text.splitlines())
+        except Exception:
+            continue
+
+    cleaned: list[str] = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "://" not in line:
+            line = "http://" + line
+        cleaned.append(line)
+
+    random.shuffle(cleaned)
+    _PROXY_LIST_CACHE = cleaned[:30]  # cap; Vercel Hobby caps duration at 300s
+    print(f"[proxy-pool] loaded {len(_PROXY_LIST_CACHE)} proxies")
+    return _PROXY_LIST_CACHE
+
+
+def _proxies_dict(proxy_url: str | None):
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def _try_one(url: str, timeout: int, proxy_url: str | None, full_retries: bool = True):
+    """Try a single fetch; return Response if it looks good, else None.
+
+    full_retries=False keeps it cheap when iterating through a public proxy pool:
+    just one cffi attempt instead of cycling impersonations.
+    """
+    proxies = _proxies_dict(proxy_url)
+    verify = not proxy_url
+
+    try:
+        r = requests.get(
+            url, headers=_GOOGLEBOT_HEADERS, timeout=timeout, proxies=proxies, verify=verify
+        )
+        if r.status_code == 200 and not _is_blocked(r.text):
+            return r
+    except Exception:
+        pass
+
+    impersonations = _IMPERSONATIONS if full_retries else _IMPERSONATIONS[:1]
+    for imp in impersonations:
+        try:
+            r = cffi_requests.get(
+                url, impersonate=imp, timeout=timeout, proxies=proxies, verify=verify
+            )
+            if r.status_code == 200 and not _is_blocked(r.text):
+                return r
+        except Exception:
+            continue
+    return None
+
+
+def _fetch(url: str, timeout: int = 60):
+    global _WORKING_PROXY
+
+    # 1) Try the last-known-working proxy first (sticky across URLs in one run).
+    if _WORKING_PROXY:
+        r = _try_one(url, timeout, _WORKING_PROXY)
+        if r is not None:
+            return r
+        _WORKING_PROXY = None
+
+    # 2) Try explicit SCRAPER_PROXY (e.g., ScraperAPI) if set.
+    if PROXY:
+        r = _try_one(url, timeout, PROXY)
+        if r is not None:
+            _WORKING_PROXY = PROXY
+            return r
+
+    # 3) Try direct (no proxy).
+    r = _try_one(url, timeout, None)
+    if r is not None:
+        return r
+
+    # 4) Rotate through the public proxy pool with short per-proxy timeout.
+    pool = _load_proxy_pool()
+    per_proxy_timeout = 5
+    for i, p in enumerate(pool):
+        r = _try_one(url, per_proxy_timeout, p, full_retries=False)
+        if r is not None:
+            print(f"[proxy-pool] success via {p} (attempt {i+1})")
+            _WORKING_PROXY = p
+            return r
+
+    raise RuntimeError(f"All proxies failed for {url}")
+
+
+SCRAPER = type(
+    "Scraper",
+    (),
+    {"get": staticmethod(lambda url, timeout=60: _fetch(url, timeout))},
+)()
 
 
 def fetch_page(url: str = URL) -> str:
@@ -87,7 +231,14 @@ def parse_last_rows(raw: str):
     return prev_date, prev_val, last_date, last_val, len(series)
 
 
-def build_dataframe(charts: list[dict]) -> pd.DataFrame:
+CHART_ROW_COLUMNS = [
+    "id", "name", "slug", "url", "country", "n_series",
+    "prev_date", "prev_value", "latest_date", "latest_value",
+    "count_booked", "count_comments", "count_liked", "description",
+]
+
+
+def build_chart_rows(charts: list[dict]) -> list[dict]:
     rows = []
     for c in charts:
         prev_date, prev_val, latest_date, latest_val, n_series = parse_last_rows(
@@ -113,8 +264,15 @@ def build_dataframe(charts: list[dict]) -> pd.DataFrame:
                 .strip(),
             }
         )
-    df = pd.DataFrame(rows)
-    return df
+    return rows
+
+
+def write_chart_rows_csv(rows: list[dict], path: Path) -> None:
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CHART_ROW_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 TARGET_MARKET_IDS = {77, 144242, 75, 76, 549, 551, 552, 550, 74, 73}
@@ -591,7 +749,7 @@ fetch('dashboard_data.json').then(r=>r.json()).then(data=>{
     thematicHtml += '<tr><td>CDS</td><td>Sovereign 5Y CDS (bps)</td><td class="val">'+cdsVals+'</td></tr>';
   }
   document.getElementById('thematicBody').innerHTML = thematicHtml;
-  const charts = data.charts;
+  const charts = data.charts; 
   document.getElementById('tableBody').innerHTML = charts.map(c=>{
     const fmt = v => v!==null && !isNaN(v) ? Number(v).toFixed(2) : '-';
     const val = fmt(c.latest_value);
@@ -605,6 +763,7 @@ fetch('dashboard_data.json').then(r=>r.json()).then(data=>{
 </html>"""
 
 
+
 def main() -> None:
     try:
         html_text = fetch_page()
@@ -612,26 +771,14 @@ def main() -> None:
         print(e)
     charts = json.loads(extract_js_value(html_text, "top_charts"))
 
-    df = build_dataframe(charts)
-    df.to_csv(CSV_PATH, index=False, encoding="utf-8-sig")
-    print(f"Saved CSV: {CSV_PATH}")
-
-    series_data = extract_all_series_data(charts)
-    with open(SERIES_JSON_PATH, "w", encoding="utf-8") as f:
-        json.dump(series_data, f, ensure_ascii=False, indent=2)
-    print(f"Saved series data: {SERIES_JSON_PATH}")
-
-    print(f"\nBuilding dashboard data ...")
     enriched = enrich_chart_data(charts)
-
     market_indicators = extract_market_indicators(html_text)
     focus_stats = extract_focus_stats(html_text)
-
     stock_indices = extract_stock_indices()
     thematic_indicators = extract_thematic_indicators()
     cds_data = extract_cds_data()
 
-    dashboard_data = {
+    return {
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         "chart_count": len(enriched),
         "charts": enriched,
@@ -640,20 +787,39 @@ def main() -> None:
         "stock_indices": stock_indices,
         "thematic_indicators": thematic_indicators,
         "cds_data": cds_data,
+        "_raw_charts": charts,
     }
-    with open(DASHBOARD_DATA_PATH, "w", encoding="utf-8") as f:
+
+
+def main(out_dir: Path | None = None) -> None:
+    out_dir = out_dir or DEFAULT_OUT_DIR
+    csv_path = out_dir / "top_charts.csv"
+    dashboard_path = out_dir / "dashboard_data.json"
+    series_path = out_dir / "series_last_rows.json"
+
+    try:
+        dashboard_data = run_scrape()
+    except Exception as e:
+        print(f"WARNING: Could not fetch page: {e}")
+        print("Using previously committed data files (data may be stale).")
+        return
+
+    charts = dashboard_data.pop("_raw_charts")
+
+    rows = build_chart_rows(charts)
+    write_chart_rows_csv(rows, csv_path)
+    print(f"Saved CSV: {csv_path}")
+
+    series_data = extract_all_series_data(charts)
+    with open(series_path, "w", encoding="utf-8") as f:
+        json.dump(series_data, f, ensure_ascii=False, indent=2)
+    print(f"Saved series data: {series_path}")
+
+    with open(dashboard_path, "w", encoding="utf-8") as f:
         json.dump(dashboard_data, f, ensure_ascii=False, indent=2)
-    print(f"Saved dashboard data: {DASHBOARD_DATA_PATH}")
+    print(f"Saved dashboard data: {dashboard_path}")
 
-    # dashboard_html = generate_dashboard_html()
-    # html_path = OUT_DIR / "index.html"
-    # html_path.write_text(dashboard_html, encoding="utf-8")
-    # print(f"Saved dashboard: {html_path}")
-
-    cols = ["id", "name", "latest_date", "latest_value", "count_booked", "url"]
-    with pd.option_context("display.max_colwidth", 50, "display.width", 200):
-        print(f"\n{df[cols].to_string(index=False)}")
-    print(f"\nDone. {len(df)} charts processed.")
+    print(f"\nDone. {len(rows)} charts processed.")
 
 
 if __name__ == "__main__":
